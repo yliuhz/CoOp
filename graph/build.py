@@ -180,7 +180,7 @@ def build_vision_graph(datapath, clipmodel):
             img0 = Image.open(impath).convert("RGB")
             img = transforms(img0)
             
-            
+            # K*224*224 images
 
 
 
