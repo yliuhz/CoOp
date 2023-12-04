@@ -141,18 +141,26 @@ def _build_transform_test(interpolation, input_size, pixel_mean, pixel_std, choi
 
     return tfm_test
 
-def build_vision_graph(datapath, clipmodel):
+def build_vision_graph(datapath, clipmodel, text_labels=None):
     device = "cuda:6"
     model = CustomCLIP(clipmodel).to(device)
 
     with open(datapath, "rb") as f:
         data = pkl.load(f)
         train = data["train"]
+        print(f"length of train: {len(train)}")
     
     visited_labels = dict()
     model_inputs = []
     N = 5 # Maximum num of images in each class, to calc the average embedding
-    image_inputs = []
+    image_labels = []
+    image_features_box = dict()
+
+    # Align with text_labels
+    if text_labels is not None:
+        for label in text_labels:
+            image_features_box[int(label)] = 0
+        print(f"Total classes: {len(image_features_box)}")
 
     # Build image transformations
     input_size = (224, 224)
@@ -167,9 +175,9 @@ def build_vision_graph(datapath, clipmodel):
     transforms = _build_transform_test(interpolation, input_size, pixel_mean, pixel_std, choices, target_size, normalize)
 
     with torch.no_grad():
-        for train_samples in train:
-            impath = train.impath
-            label = train.label
+        for train_sample in train:
+            impath = train_sample.impath
+            label = train_sample.label
 
             if not label in visited_labels.keys():
                 visited_labels[label] = 0
@@ -180,11 +188,36 @@ def build_vision_graph(datapath, clipmodel):
             img0 = Image.open(impath).convert("RGB")
             img = transforms(img0)
             
-            # K*224*224 images
+            model_inputs.append(img.unsqueeze(0))
+            image_labels.append(label)
 
+        model_inputs = torch.cat(model_inputs).to(device)
+        print(model_inputs.shape)
+        image_features = model.encode_image(model_inputs)
+        print(f"image_features.shape: {image_features.shape}")
 
+        for i in range(image_features.shape[0]):
+            image_feature = image_features[i]
+            label = image_labels[i]
+            n_images = visited_labels[label]
+            
+            try:
+                image_features_box[int(label)] += image_feature.unsqueeze(0) / n_images
+            except:
+                print(f"Error: {label} not in text_labels !!")
+        
+        print(f"image_features_box[0].shape: {image_features_box[0].shape}")
+        image_features_avg = torch.cat(list(image_features_box.values()))
+        print(f"image_features_avg.shape: {image_features_avg.shape}")
+        adj_full = image_features_avg @ image_features_avg.t()
 
-            raise NotImplementedError()
+        # Back to cpu before return 
+        adj_full = adj_full.to("cpu")
+        image_features = image_features_avg.to("cpu")
+        labels = torch.LongTensor(list(image_features_box.keys()))
+
+    return image_features, adj_full, labels
+
 
 class myDataset(Dataset):
     def __init__(self, x, edge_index, edge_weight):
@@ -203,6 +236,9 @@ if __name__ == "__main__":
     clipmodel = load_clip_to_cpu()
     datapath = f"/data/yliumh/caltech-101/split_fewshot/shot_16-seed_1.pkl"
 
+
+    # Build text graph
+    print("Building text graph")
     text_features, text_adj, text_labels, tokenized_texts = build_textual_graph(datapath, clipmodel)
 
     print(text_features.shape, text_adj.shape)
@@ -235,5 +271,35 @@ if __name__ == "__main__":
         pkl.dump(text_graph, f)
     
 
-    pass
+    # Build image graph
+    print("Building vision graph")
+    image_features, image_adj, image_labels = build_vision_graph(datapath, clipmodel, text_labels)
+    assert torch.sum(image_labels - text_labels) == 0 # Two modals have aligned
+
+    print(image_features.shape, image_adj.shape)
+    print(image_adj[:20, :20])
+
+    # build torch_geometric graph: data=[x, edge_index, edge_weight]
+    n, h = image_features.shape
+    edge_weight = image_adj.reshape(-1)
+    edge_index = []
+    for i in range(n):
+        for j in range(n):
+            edge_index.append([i,j])
+    edge_index = torch.tensor(edge_index)
+
+    print(f"{image_features.dtype}")
+    print(f"{edge_index.dtype}")
+    print(f"{edge_weight.dtype}")
+    print(f"{image_labels.dtype}")
+
+    image_graph = {
+        "x": image_features,
+        "edge_index": edge_index.transpose(1,0),
+        "edge_weight": edge_weight,
+        "y": image_labels,
+    }
+
+    with open("image_graph.pkl", "wb") as f:
+        pkl.dump(image_graph, f)
 

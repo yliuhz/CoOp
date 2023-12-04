@@ -110,7 +110,7 @@ class GCN(nn.Module):
         return self.act(out)
 
 class GNNClip(nn.Module):
-    def __init__(self, clip_model, text, x, adj):
+    def __init__(self, clip_model, text, text_x, text_adj, image_x, image_adj, alpha=0.6, beta=0.7):
         super().__init__()
         # self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
         # self.tokenized_prompts = self.prompt_learner.tokenized_prompts
@@ -131,8 +131,13 @@ class GNNClip(nn.Module):
         print(f"ctx_dim= {ctx_dim}")
 
         self.text = text
-        self.x = x
-        self.adj = adj
+        self.text_x = text_x
+        self.text_adj = text_adj
+        self.image_x = image_x
+        self.image_adj = image_adj
+
+        self.alpha = alpha
+        self.beta = beta
     
     def forward_(self, image, text, x, edge_index, edge_weight):
         image_features = self.clip_model.encode_image(image.type(self.dtype))
@@ -159,8 +164,11 @@ class GNNClip(nn.Module):
         text_features = self.clip_model.encode_text(self.text)
 
         # GCN
-        text_features_gnn = self.text_gnn(self.x, self.adj, sparse=False) # x表示的类的顺序与text的顺序一致
-        text_features = 0.6*text_features + 0.4*text_features_gnn # residual connection
+        text_features_gnn = self.text_gnn(self.text_x, self.text_adj, sparse=False) # x表示的类的顺序与text的顺序一致
+        visual_features_gnn = self.visual_gnn(self.image_x, self.image_adj, sparse=False) 
+        text_features_gnn = self.beta*text_features_gnn + (1-self.beta)*visual_features_gnn # multi modal aggregation
+
+        text_features = self.alpha*text_features + (1-self.alpha)*text_features_gnn # residual connection
 
 
         # normalized features
@@ -206,29 +214,43 @@ class GraphOp(TrainerX):
 
         self.dm = dm
 
+        # 读取构建好的文本图
         # dassl 重写了从磁盘读取的函数，导致单GPU报错
         with open(f"/home/yliumh/github/CoOp/graph/text_graph.pkl", "rb") as f:
             data = pkl.load(f)
-            x, edge_index, edge_weight, labels, texts = data["x"], data["edge_index"], data["edge_weight"], data["y"], data["texts"]
+            text_x, text_edge_index, text_edge_weight, text_labels, texts = data["x"], data["edge_index"], data["edge_weight"], data["y"], data["texts"]
         
-        print(f"edge_index.shape: {edge_index.shape}")
-        self.x = x.to(self.device)
-        self.edge_index = edge_index.to(self.device)
-        self.edge_weight = edge_weight.to(self.device)
-        self.labels = labels.to(self.device)
+        self.text_x = text_x.to(self.device)
+        self.text_edge_index = text_edge_index.to(self.device)
+        self.text_edge_weight = text_edge_weight.to(self.device)
+        self.text_labels = text_labels.to(self.device)
         self.texts = texts.to(self.device)
         
         # construct adj from edge_index and edge_weight
-        n,d = self.x.shape
-        adj = torch.zeros((n,n))
-        for idx, (u,v) in enumerate(edge_index.T):
-            weight = edge_weight[idx]
-            adj[u,v] = adj[v,u] = weight
-        self.adj = adj.type(self.x.dtype).to(self.device)
+        n,d = self.text_x.shape
+        text_adj = torch.zeros((n,n))
+        for idx, (u,v) in enumerate(text_edge_index.T):
+            text_weight = text_edge_weight[idx]
+            text_adj[u,v] = text_adj[v,u] = text_weight
+        self.text_adj = text_adj.type(self.text_x.dtype).to(self.device)
 
-        print(f"Graphs shapes: {x.shape} {edge_index.shape} {edge_weight.shape} {labels.shape} {texts.shape}")
-        print(f"Graph types: {x.dtype} {edge_index.dtype} {edge_weight.dtype} {labels.dtype} {texts.dtype}")
-        print(f"Edge weights: {self.adj.sum()} {self.edge_weight.sum()*2}")
+        # 读取构建好的视觉图
+        with open(f"/home/yliumh/github/CoOp/graph/image_graph.pkl", "rb") as f:
+            data = pkl.load(f)
+            image_x, image_edge_index, image_edge_weight, image_labels = data["x"], data["edge_index"], data["edge_weight"], data["y"]
+        
+        self.image_x = image_x.to(self.device)
+        self.image_edge_index = image_edge_index.to(self.device)
+        self.image_edge_weight = image_edge_weight.to(self.device)
+        self.image_labels = image_labels.to(self.device)
+        
+        # construct adj from edge_index and edge_weight
+        n,d = self.image_x.shape
+        image_adj = torch.zeros((n,n))
+        for idx, (u,v) in enumerate(image_edge_index.T):
+            image_weight = image_edge_weight[idx]
+            image_adj[u,v] = image_adj[v,u] = image_weight
+        self.image_adj = image_adj.type(self.image_x.dtype).to(self.device)
 
 
     def check_cfg(self, cfg):
@@ -246,23 +268,24 @@ class GraphOp(TrainerX):
             clip_model.float()
 
         print("Building custom CLIP")
-        self.model = GNNClip(clip_model, self.texts, self.x, self.adj)
+        self.model = GNNClip(clip_model, self.texts, self.text_x, self.text_adj, self.image_x, self.image_adj)
 
         print("Turning off gradients in both the image and the text encoder")
         for name, param in self.model.named_parameters():
-            if "text_gnn" not in name:
+            if "text_gnn" not in name and "visual_gnn" not in name:
                 param.requires_grad_(False) # 冻结CLIP的预训练权重
 
-        if cfg.MODEL.INIT_WEIGHTS:
-            load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
+        # if cfg.MODEL.INIT_WEIGHTS:
+        #     load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
 
         self.model.to(self.device)
         # NOTE: only give prompt_learner to the optimizer
         # self.optim = build_optimizer(self.model.prompt_learner, cfg.OPTIM)
-        self.optim = build_optimizer(self.model.text_gnn, cfg.OPTIM)
+        self.optim = build_optimizer(self.model, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         # self.register_model("prompt_learner", self.model.prompt_learner, self.optim, self.sched)
         self.register_model("text_gnn", self.model.text_gnn, self.optim, self.sched)
+        self.register_model("visual_gnn", self.model.visual_gnn, self.optim, self.sched)
 
         self.scaler = GradScaler() if cfg.TRAINER.COOP.PREC == "amp" else None
 
